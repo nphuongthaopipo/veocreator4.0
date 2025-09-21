@@ -45,7 +45,7 @@ async function handleApiRequest(_event, { url, cookie, options }) {
 }
 
 // =================================================================
-// 2. LOGIC TỰ ĐỘNG HÓA TRÌNH DUYỆT (ĐÃ HOÀN THIỆN)
+// 2. LOGIC TỰ ĐỘNG HÓA TRÌNH DUYỆT (ĐÃ SỬA LỖI)
 // =================================================================
 ipcMain.on('browser:start-automation', async (event, { prompts }) => {
     const mainWindow = BrowserWindow.fromWebContents(event.sender);
@@ -101,84 +101,54 @@ ipcMain.on('browser:start-automation', async (event, { prompts }) => {
         await page.waitForSelector(promptInputSelector, { timeout: 60000 });
         sendLog(firstPromptId, 'Đã sẵn sàng để xử lý prompts.', 'running');
         
-        const MAX_CONCURRENT = 5;
-        let promptIndex = 0;
-        const totalPrompts = prompts.length;
-        const completedPrompts = new Set(); 
+        for (const prompt of prompts) {
+            try {
+                const initialVideoCount = await page.evaluate(() => document.querySelectorAll('video[src^="https://storage.googleapis.com"]').length);
 
-        // Vòng lặp chính để quản lý toàn bộ quy trình
-        while (completedPrompts.size < totalPrompts) {
-            const currentlyProcessingCount = await page.evaluate(() => document.querySelectorAll('div[role="progressbar"]').length);
-
-            // Gửi prompt mới nếu còn "suất" trống và còn prompt trong hàng đợi
-            if (currentlyProcessingCount < MAX_CONCURRENT && promptIndex < totalPrompts) {
-                const prompt = prompts[promptIndex];
+                sendLog(prompt.id, 'Bắt đầu xử lý prompt...', 'running');
+                await page.type(promptInputSelector, prompt.text, { delay: 20 });
                 
-                try {
-                    sendLog(prompt.id, 'Bắt đầu xử lý prompt...', 'running');
-                    await page.type(promptInputSelector, prompt.text, { delay: 20 });
-                    
-                    const generateButtonSelector = "button[aria-label='Tạo']";
-                    await page.waitForSelector(generateButtonSelector, { visible: true, timeout: 10000 });
-                    
-                    // Chuẩn bị chờ request xác nhận
-                    const requestPromise = page.waitForRequest(
-                        request => request.url().includes('video:batchCheckAsyncVideoGenerationStatus') && request.method() === 'POST'
-                    );
-
-                    await page.click(generateButtonSelector);
-                    
-                    // **SỬA LỖI LOGIC:** Chờ request batchCheck... xuất hiện để xác nhận
-                    await requestPromise;
-                    
-                    sendLog(prompt.id, 'Đã gửi yêu cầu, video đang được xử lý...', 'running');
-                    promptIndex++;
-
-                } catch (promptError) {
-                    sendLog(prompt.id, `Lỗi khi gửi prompt: ${promptError.message}`, 'error');
-                    // Đánh dấu là đã xử lý (dù lỗi) để vòng lặp không bị kẹt
-                    completedPrompts.add(prompt.id); 
-                }
-            }
-
-            // Tìm video đã hoàn thành mà chưa được xử lý
-            const completedVideoData = await page.evaluate((processedPromptTexts) => {
-                // Lấy tất cả các khối chứa prompt và video
-                const allBlocks = Array.from(document.querySelectorAll('div.sc-b8dc20d4-15, div.sc-b8dc20d4-10'));
-                
-                for (let i = 0; i < allBlocks.length; i++) {
-                    const currentBlock = allBlocks[i];
-                    // Tìm một khối video
-                    const videoElement = currentBlock.querySelector('video[src^="https://storage.googleapis.com"]');
-
-                    // Nếu là khối video và không có thanh progress bar -> đã hoàn thành
-                    if (videoElement && !currentBlock.querySelector('div[role="progressbar"]')) {
-                        // Lấy khối prompt ngay phía trên nó
-                        const promptBlock = allBlocks[i - 1];
-                        if (promptBlock) {
-                            const promptText = (promptBlock as HTMLElement).innerText;
-                            // Kiểm tra xem prompt này đã được xử lý chưa
-                            if (!processedPromptTexts.includes(promptText)) {
-                                return {
-                                    url: (videoElement as HTMLVideoElement).src,
-                                    prompt: promptText
-                                };
-                            }
-                        }
+                // **SỬA LỖI:** Dùng evaluate để tìm và click chính xác nút Gửi (mũi tên)
+                await page.evaluate(() => {
+                    const buttons = Array.from(document.querySelectorAll('button'));
+                    const targetButton = buttons.find(btn => {
+                        const icon = btn.querySelector('.google-symbols');
+                        return icon && icon.textContent.trim() === 'arrow_forward';
+                    });
+                    if (targetButton) {
+                        (targetButton as HTMLElement).click();
+                    } else {
+                        throw new Error('Không tìm thấy nút Gửi prompt (biểu tượng mũi tên).');
                     }
-                }
-                return null;
-            }, Array.from(completedPrompts).map(id => prompts.find(p => p.id === id)?.text));
+                });
 
-            if (completedVideoData) {
-                const correspondingPrompt = prompts.find(p => p.text === completedVideoData.prompt);
-                if (correspondingPrompt && !completedPrompts.has(correspondingPrompt.id)) {
-                    sendLog(correspondingPrompt.id, 'Video đã hoàn thành!', 'success', completedVideoData.url);
-                    completedPrompts.add(correspondingPrompt.id);
+                sendLog(prompt.id, 'Đã gửi yêu cầu, đang chờ video được tạo...', 'running');
+
+                await page.waitForFunction(
+                    (expectedCount) => document.querySelectorAll('video[src^="https://storage.googleapis.com"]').length > expectedCount,
+                    { timeout: 300000 },
+                    initialVideoCount
+                );
+                
+                const videoUrl = await page.evaluate(() => {
+                    const videoElements = document.querySelectorAll('video[src^="https://storage.googleapis.com"]');
+                    const lastVideo = videoElements[videoElements.length - 1] as HTMLVideoElement;
+                    return lastVideo ? lastVideo.src : null;
+                });
+
+                if (videoUrl) {
+                    sendLog(prompt.id, 'Video đã hoàn thành!', 'success', videoUrl);
+                } else {
+                    sendLog(prompt.id, 'Video đã hoàn thành nhưng không tìm thấy URL!', 'error');
                 }
+
+                await page.click(promptInputSelector, { clickCount: 3 });
+                await page.keyboard.press('Backspace');
+                await new Promise(resolve => setTimeout(resolve, 500));
+                
+            } catch (promptError) {
+                 sendLog(prompt.id, `Lỗi khi xử lý prompt: ${promptError.message}`, 'error');
             }
-            
-            await new Promise(resolve => setTimeout(resolve, 3000)); // Chờ 3 giây trước khi lặp lại
         }
         
         sendLog(firstPromptId, 'Tất cả các prompt đã được xử lý!', 'success');
