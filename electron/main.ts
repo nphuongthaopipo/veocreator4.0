@@ -45,7 +45,7 @@ async function handleApiRequest(_event, { url, cookie, options }) {
 }
 
 // =================================================================
-// 2. LOGIC TỰ ĐỘNG HÓA TRÌNH DUYỆT (QUY TRÌNH SONG SONG & THEO DÕI API)
+// 2. LOGIC TỰ ĐỘNG HÓA TRÌNH DUYỆT (ĐÃ HOÀN THIỆN)
 // =================================================================
 ipcMain.on('browser:start-automation', async (event, { prompts }) => {
     const mainWindow = BrowserWindow.fromWebContents(event.sender);
@@ -81,7 +81,6 @@ ipcMain.on('browser:start-automation', async (event, { prompts }) => {
         }
         sendLog(firstPromptId, 'Đã đăng nhập!', 'running');
 
-        let projectId;
         if (!page.url().includes('/project/')) {
             sendLog(firstPromptId, 'Tự động tạo dự án mới qua API...', 'running');
             const newProject = await page.evaluate(() => {
@@ -91,112 +90,97 @@ ipcMain.on('browser:start-automation', async (event, { prompts }) => {
                     body: JSON.stringify({ json: { projectTitle: `Veo Project Auto - ${new Date().toLocaleString()}`, toolName: "PINHOLE" }})
                 }).then(res => res.json());
             });
-            projectId = newProject?.result?.data?.json?.result?.projectId;
+            const projectId = newProject?.result?.data?.json?.result?.projectId;
             if (!projectId) throw new Error('Không thể tạo dự án mới qua API.');
             const newProjectUrl = `https://labs.google/fx/vi/tools/flow/project/${projectId}`;
             sendLog(firstPromptId, `Đã tạo dự án ${projectId}. Đang điều hướng...`, 'running');
             await page.goto(newProjectUrl, { waitUntil: 'networkidle2' });
-        } else {
-            projectId = page.url().split('/project/')[1].split('/')[0];
-            sendLog(firstPromptId, `Đang ở trong dự án ${projectId}.`, 'running');
         }
         
+        const promptInputSelector = 'textarea#PINHOLE_TEXT_AREA_ELEMENT_ID';
+        await page.waitForSelector(promptInputSelector, { timeout: 60000 });
         sendLog(firstPromptId, 'Đã sẵn sàng để xử lý prompts.', 'running');
-
-        // **LOGIC TẠO VIDEO SONG SONG NÂNG CAO**
+        
         const MAX_CONCURRENT = 5;
-        const POLL_INTERVAL = 10000; // 10 giây
-        const promptQueue = [...prompts];
-        const processingMap = new Map(); // Key: sceneId, Value: {prompt, operationName, sceneId}
+        let promptIndex = 0;
+        const totalPrompts = prompts.length;
+        const completedPrompts = new Set(); 
 
-        const checkStatus = async () => {
-            if (processingMap.size === 0) return;
-            const operationsToCheck = Array.from(processingMap.values()).map(p => ({
-                operation: { name: p.operationName },
-                sceneId: p.sceneId,
-            }));
+        // Vòng lặp chính để quản lý toàn bộ quy trình
+        while (completedPrompts.size < totalPrompts) {
+            const currentlyProcessingCount = await page.evaluate(() => document.querySelectorAll('div[role="progressbar"]').length);
 
-            try {
-                const statusResponse = await page.evaluate((ops) => {
-                    // Hàm fetch này được thực thi trong ngữ cảnh của trình duyệt,
-                    // nên nó sẽ tự động sử dụng cookie và token xác thực của người dùng.
-                    return fetch('https://aisandbox-pa.googleapis.com/v1/video:batchCheckAsyncVideoGenerationStatus', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ operations: [ops] }),
-                    }).then(res => res.json());
-                }, operationsToCheck);
-                
-                if (!statusResponse || !statusResponse.operations) return;
-
-                for (const operationStatus of statusResponse.operations) {
-                    const sceneId = operationStatus?.operation?.metadata?.sceneId;
-                    const promptInProcess = processingMap.get(sceneId);
-                    if (!promptInProcess) continue;
-
-                    if (operationStatus?.status === 'MEDIA_GENERATION_STATUS_SUCCESSFUL') {
-                        const videoUrl = operationStatus?.operation?.metadata?.video?.servingBaseUri;
-                        sendLog(promptInProcess.id, 'Video đã hoàn thành!', 'success', videoUrl);
-                        processingMap.delete(sceneId);
-                    } else if (operationStatus?.status === 'MEDIA_GENERATION_STATUS_FAILED') {
-                        sendLog(promptInProcess.id, `Lỗi: ${operationStatus?.error?.message || 'Không rõ'}`, 'error');
-                        processingMap.delete(sceneId);
-                    }
-                }
-            } catch (err) {
-                console.error("Lỗi khi kiểm tra trạng thái:", err);
-            }
-        };
-
-        const poller = setInterval(checkStatus, POLL_INTERVAL);
-
-        while (promptQueue.length > 0 || processingMap.size > 0) {
-            if (promptQueue.length > 0 && processingMap.size < MAX_CONCURRENT) {
-                const prompt = promptQueue.shift();
+            // Gửi prompt mới nếu còn "suất" trống và còn prompt trong hàng đợi
+            if (currentlyProcessingCount < MAX_CONCURRENT && promptIndex < totalPrompts) {
+                const prompt = prompts[promptIndex];
                 
                 try {
-                    sendLog(prompt.id, 'Gửi yêu cầu tạo video...', 'running');
-                    // Sử dụng page.evaluate để thực thi fetch trong ngữ cảnh của trình duyệt đã đăng nhập
-                    const responseData = await page.evaluate(async (pId, pText) => {
-                        const clientSceneId = `client-generated-uuid-${Date.now()}-${Math.random()}`;
-                        const res = await fetch('https://aisandbox-pa.googleapis.com/v1/video:batchAsyncGenerateVideoText', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({
-                                clientContext: { projectId: pId, tool: "PINHOLE" },
-                                requests: [{
-                                    aspectRatio: "VIDEO_ASPECT_RATIO_LANDSCAPE",
-                                    seed: Math.floor(Math.random() * 100000),
-                                    textInput: { prompt: pText },
-                                    videoModelKey: "veo_3_0_t2v_fast",
-                                    metadata: [{ sceneId: clientSceneId }]
-                                }]
-                            })
-                        });
-                        return res.json();
-                    }, projectId, prompt.text);
-
-                    const operation = responseData?.operations?.[0];
-                    const serverSceneId = operation?.sceneId;
+                    sendLog(prompt.id, 'Bắt đầu xử lý prompt...', 'running');
+                    await page.type(promptInputSelector, prompt.text, { delay: 20 });
                     
-                    if (!operation || !operation.operation?.name || !serverSceneId) {
-                        console.error("Phản hồi không hợp lệ từ API:", JSON.stringify(responseData));
-                        throw new Error("Không nhận được operationName hoặc sceneId từ API.");
-                    }
-                    const { name: operationName } = operation.operation;
+                    const generateButtonSelector = "button[aria-label='Tạo']";
+                    await page.waitForSelector(generateButtonSelector, { visible: true, timeout: 10000 });
+                    
+                    // Chuẩn bị chờ request xác nhận
+                    const requestPromise = page.waitForRequest(
+                        request => request.url().includes('video:batchCheckAsyncVideoGenerationStatus') && request.method() === 'POST'
+                    );
 
-                    sendLog(prompt.id, 'Đã gửi yêu cầu, đang chờ xử lý...', 'running');
-                    processingMap.set(serverSceneId, { ...prompt, operationName, sceneId: serverSceneId });
+                    await page.click(generateButtonSelector);
+                    
+                    // **SỬA LỖI LOGIC:** Chờ request batchCheck... xuất hiện để xác nhận
+                    await requestPromise;
+                    
+                    sendLog(prompt.id, 'Đã gửi yêu cầu, video đang được xử lý...', 'running');
+                    promptIndex++;
 
                 } catch (promptError) {
                     sendLog(prompt.id, `Lỗi khi gửi prompt: ${promptError.message}`, 'error');
+                    // Đánh dấu là đã xử lý (dù lỗi) để vòng lặp không bị kẹt
+                    completedPrompts.add(prompt.id); 
                 }
             }
-            // Thay thế page.waitForTimeout bằng Promise an toàn hơn
-            await new Promise(resolve => setTimeout(resolve, 2000)); 
-        }
 
-        clearInterval(poller);
+            // Tìm video đã hoàn thành mà chưa được xử lý
+            const completedVideoData = await page.evaluate((processedPromptTexts) => {
+                // Lấy tất cả các khối chứa prompt và video
+                const allBlocks = Array.from(document.querySelectorAll('div.sc-b8dc20d4-15, div.sc-b8dc20d4-10'));
+                
+                for (let i = 0; i < allBlocks.length; i++) {
+                    const currentBlock = allBlocks[i];
+                    // Tìm một khối video
+                    const videoElement = currentBlock.querySelector('video[src^="https://storage.googleapis.com"]');
+
+                    // Nếu là khối video và không có thanh progress bar -> đã hoàn thành
+                    if (videoElement && !currentBlock.querySelector('div[role="progressbar"]')) {
+                        // Lấy khối prompt ngay phía trên nó
+                        const promptBlock = allBlocks[i - 1];
+                        if (promptBlock) {
+                            const promptText = (promptBlock as HTMLElement).innerText;
+                            // Kiểm tra xem prompt này đã được xử lý chưa
+                            if (!processedPromptTexts.includes(promptText)) {
+                                return {
+                                    url: (videoElement as HTMLVideoElement).src,
+                                    prompt: promptText
+                                };
+                            }
+                        }
+                    }
+                }
+                return null;
+            }, Array.from(completedPrompts).map(id => prompts.find(p => p.id === id)?.text));
+
+            if (completedVideoData) {
+                const correspondingPrompt = prompts.find(p => p.text === completedVideoData.prompt);
+                if (correspondingPrompt && !completedPrompts.has(correspondingPrompt.id)) {
+                    sendLog(correspondingPrompt.id, 'Video đã hoàn thành!', 'success', completedVideoData.url);
+                    completedPrompts.add(correspondingPrompt.id);
+                }
+            }
+            
+            await new Promise(resolve => setTimeout(resolve, 3000)); // Chờ 3 giây trước khi lặp lại
+        }
+        
         sendLog(firstPromptId, 'Tất cả các prompt đã được xử lý!', 'success');
 
     } catch (error) {
